@@ -1,7 +1,6 @@
 from pipeline import RollingForcingTrainingPipeline
 import torch.nn.functional as F
 from typing import Optional, Tuple
-import copy
 import torch
 
 from model.base import RollingForcingModel
@@ -46,18 +45,6 @@ class DMD(RollingForcingModel):
         self.ts_schedule = getattr(args, "ts_schedule", True)
         self.ts_schedule_max = getattr(args, "ts_schedule_max", False)
         self.min_score_timestep = getattr(args, "min_score_timestep", 0)
-        self.gan_loss_weight_gen = getattr(args, "gan_loss_weight_gen", 0.0)
-        self.gan_loss_weight_disc = getattr(args, "gan_loss_weight_disc", 0.0)
-        self.concat_time_embeddings = getattr(args, "concat_time_embeddings", False)
-        self.use_relativistic_gan = getattr(args, "relativistic_discriminator", False)
-        self.use_gan_loss = (self.gan_loss_weight_gen > 0.0) or (self.gan_loss_weight_disc > 0.0)
-
-        if self.use_gan_loss:
-            self.fake_score.adding_cls_branch(
-                atten_dim=1536,
-                num_class=getattr(args, "num_class", 1),
-                time_embed_dim=1536 if self.concat_time_embeddings else 0
-            )
 
         if getattr(self.scheduler, "alphas_cumprod", None) is not None:
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
@@ -160,51 +147,6 @@ class DMD(RollingForcingModel):
             **real_cond_log,
             **real_uncond_log,
         }
-
-    def _sample_critic_timestep(
-        self,
-        image_or_video_shape,
-        denoised_timestep_from: int = 0,
-        denoised_timestep_to: int = 0
-    ) -> torch.Tensor:
-        min_timestep = denoised_timestep_to if self.ts_schedule and denoised_timestep_to is not None else self.min_score_timestep
-        max_timestep = denoised_timestep_from if self.ts_schedule_max and denoised_timestep_from is not None else self.num_train_timestep
-        critic_timestep = self._get_timestep(
-            min_timestep,
-            max_timestep,
-            image_or_video_shape[0],
-            image_or_video_shape[1],
-            self.num_frame_per_block,
-            uniform_timestep=True
-        )
-
-        if self.timestep_shift > 1:
-            critic_timestep = self.timestep_shift * \
-                (critic_timestep / 1000) / (1 + (self.timestep_shift - 1) * (critic_timestep / 1000)) * 1000
-
-        return critic_timestep.clamp(self.min_step, self.max_step)
-
-    def _run_discriminator_logits(
-        self,
-        noisy_fake_latent: torch.Tensor,
-        noisy_real_latent: torch.Tensor,
-        conditional_dict: dict,
-        critic_timestep: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-        conditional_dict_cloned = copy.deepcopy(conditional_dict)
-        conditional_dict_cloned["prompt_embeds"] = torch.concatenate(
-            (conditional_dict_cloned["prompt_embeds"], conditional_dict_cloned["prompt_embeds"]), dim=0
-        )
-
-        _, _, noisy_logit = self.fake_score(
-            noisy_image_or_video=torch.concatenate((noisy_fake_latent, noisy_real_latent), dim=0),
-            conditional_dict=conditional_dict_cloned,
-            timestep=torch.concatenate((critic_timestep, critic_timestep), dim=0),
-            classify_mode=True,
-            concat_time_embeddings=self.concat_time_embeddings
-        )
-        noisy_fake_logit, noisy_real_logit = noisy_logit.chunk(2, dim=0)
-        return noisy_fake_logit, noisy_real_logit, self._get_routing_log(self.fake_score, "gan_disc_score")
 
     def compute_distribution_matching_loss(
         self,
@@ -313,43 +255,7 @@ class DMD(RollingForcingModel):
             denoised_timestep_to=denoised_timestep_to
         )
 
-        gan_g_loss = torch.zeros_like(dmd_loss)
-        if self.use_gan_loss and (self.gan_loss_weight_gen > 0.0) and (clean_latent is not None):
-            critic_timestep = self._sample_critic_timestep(
-                image_or_video_shape, denoised_timestep_from, denoised_timestep_to)
-            critic_noise = torch.randn_like(pred_image)
-            noisy_fake_latent = self.scheduler.add_noise(
-                pred_image.flatten(0, 1),
-                critic_noise.flatten(0, 1),
-                critic_timestep.flatten(0, 1)
-            ).unflatten(0, image_or_video_shape[:2])
-            noisy_real_latent = self.scheduler.add_noise(
-                clean_latent.flatten(0, 1),
-                critic_noise.flatten(0, 1),
-                critic_timestep.flatten(0, 1)
-            ).unflatten(0, image_or_video_shape[:2])
-            noisy_fake_logit, noisy_real_logit, gan_disc_routing_log = self._run_discriminator_logits(
-                noisy_fake_latent=noisy_fake_latent,
-                noisy_real_latent=noisy_real_latent,
-                conditional_dict=conditional_dict,
-                critic_timestep=critic_timestep
-            )
-            if not self.use_relativistic_gan:
-                gan_g_loss = F.softplus(-noisy_fake_logit.float()).mean() * self.gan_loss_weight_gen
-            else:
-                gan_g_loss = F.softplus(-(noisy_fake_logit - noisy_real_logit).float()).mean() * self.gan_loss_weight_gen
-            dmd_log_dict.update({
-                "gan_g_loss": gan_g_loss.detach(),
-                "gan_critic_timestep": critic_timestep.detach(),
-                **gan_disc_routing_log,
-            })
-
-        total_generator_loss = dmd_loss + gan_g_loss
-        dmd_log_dict.update({
-            "dmd_loss": dmd_loss.detach(),
-            "generator_total_loss": total_generator_loss.detach(),
-        })
-        return total_generator_loss, dmd_log_dict
+        return dmd_loss, dmd_log_dict
 
     def critic_loss(
         self,
@@ -383,8 +289,22 @@ class DMD(RollingForcingModel):
             )
 
         # Step 2: Compute the fake prediction
-        critic_timestep = self._sample_critic_timestep(
-            image_or_video_shape, denoised_timestep_from, denoised_timestep_to)
+        min_timestep = denoised_timestep_to if self.ts_schedule and denoised_timestep_to is not None else self.min_score_timestep
+        max_timestep = denoised_timestep_from if self.ts_schedule_max and denoised_timestep_from is not None else self.num_train_timestep
+        critic_timestep = self._get_timestep(
+            min_timestep,
+            max_timestep,
+            image_or_video_shape[0],
+            image_or_video_shape[1],
+            self.num_frame_per_block,
+            uniform_timestep=True
+        )
+
+        if self.timestep_shift > 1:
+            critic_timestep = self.timestep_shift * \
+                (critic_timestep / 1000) / (1 + (self.timestep_shift - 1) * (critic_timestep / 1000)) * 1000
+
+        critic_timestep = critic_timestep.clamp(self.min_step, self.max_step)
 
         critic_noise = torch.randn_like(generated_image)
         noisy_generated_image = self.scheduler.add_noise(
@@ -429,45 +349,10 @@ class DMD(RollingForcingModel):
             flow_pred=flow_pred
         )
 
-        gan_d_loss = torch.zeros_like(denoising_loss)
-        gan_disc_routing_log = {}
-        noisy_fake_logit, noisy_real_logit = None, None
-        if self.use_gan_loss and (self.gan_loss_weight_disc > 0.0) and (clean_latent is not None):
-            noisy_real_latent = self.scheduler.add_noise(
-                clean_latent.flatten(0, 1),
-                critic_noise.flatten(0, 1),
-                critic_timestep.flatten(0, 1)
-            ).unflatten(0, image_or_video_shape[:2])
-            noisy_fake_logit, noisy_real_logit, gan_disc_routing_log = self._run_discriminator_logits(
-                noisy_fake_latent=noisy_generated_image,
-                noisy_real_latent=noisy_real_latent,
-                conditional_dict=conditional_dict,
-                critic_timestep=critic_timestep
-            )
-            if not self.use_relativistic_gan:
-                gan_d_loss = (
-                    F.softplus(-noisy_real_logit.float()).mean() +
-                    F.softplus(noisy_fake_logit.float()).mean()
-                ) * self.gan_loss_weight_disc
-            else:
-                gan_d_loss = F.softplus(-(noisy_real_logit - noisy_fake_logit).float()).mean() * self.gan_loss_weight_disc
-
-        total_critic_loss = denoising_loss + gan_d_loss
-
         # Step 5: Debugging Log
         critic_log_dict = {
             "critic_timestep": critic_timestep.detach(),
             "critic_high_noise_ratio": (critic_timestep > self.score_model_timestep_threshold).float().mean().detach(),
-            "denoising_loss": denoising_loss.detach(),
-            "gan_d_loss": gan_d_loss.detach(),
-            "critic_total_loss": total_critic_loss.detach(),
             **fake_critic_routing_log,
-            **gan_disc_routing_log,
         }
-        if noisy_real_logit is not None and noisy_fake_logit is not None:
-            critic_log_dict.update({
-                "noisy_real_logit": noisy_real_logit.detach(),
-                "noisy_fake_logit": noisy_fake_logit.detach(),
-            })
-
-        return total_critic_loss, critic_log_dict
+        return denoising_loss, critic_log_dict

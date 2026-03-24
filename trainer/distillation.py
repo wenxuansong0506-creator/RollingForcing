@@ -373,17 +373,6 @@ class Trainer:
                         self.step
                     )
                     for key in [
-                        "dmd_loss",
-                        "gan_g_loss",
-                        "generator_total_loss",
-                    ]:
-                        if key in generator_log_dict:
-                            self.writer.add_scalar(
-                                key,
-                                generator_log_dict[key].float().mean().item(),
-                                self.step
-                            )
-                    for key in [
                         "high_noise_ratio",
                         "fake_cond_score_high_noise_ratio_actual",
                         "fake_uncond_score_high_noise_ratio_actual",
@@ -415,19 +404,6 @@ class Trainer:
                     critic_log_dict["critic_grad_norm"].mean().item(),
                     self.step
                 )
-                for key in [
-                    "denoising_loss",
-                    "gan_d_loss",
-                    "critic_total_loss",
-                    "noisy_real_logit",
-                    "noisy_fake_logit",
-                ]:
-                    if key in critic_log_dict:
-                        self.writer.add_scalar(
-                            key,
-                            critic_log_dict[key].float().mean().item(),
-                            self.step
-                        )
                 for key in [
                     "critic_high_noise_ratio",
                     "critic_fake_score_high_noise_ratio_actual",

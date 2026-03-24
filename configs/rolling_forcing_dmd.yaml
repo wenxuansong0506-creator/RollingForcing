@@ -8,8 +8,6 @@ real_high_noise_name: Wan2.2-T2V-high-noise
 fake_low_noise_name: Wan2.2-T2V-low-noise
 fake_high_noise_name: Wan2.2-T2V-high-noise
 score_model_timestep_threshold: 750
-gan_loss_weight_gen: 0.01
-gan_loss_weight_disc: 0.01
 text_encoder_fsdp_wrap_strategy: size
 denoising_step_list:
 - 1000
