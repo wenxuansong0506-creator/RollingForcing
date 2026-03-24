@@ -35,7 +35,7 @@ def main():
         trainer = GANTrainer(config)
     elif config.trainer == "ode":
         trainer = ODETrainer(config)
-    elif config.trainer == "score_distillation":
+    elif config.trainer in ["score_distillation", "diagdistillation"]:
         trainer = ScoreDistillationTrainer(config)
     trainer.train()
 
