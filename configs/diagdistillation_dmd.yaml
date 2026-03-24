@@ -15,7 +15,7 @@ denoising_step_list:
 - 600
 - 400
 - 200
-warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
+warp_denoising_step: true
 ts_schedule: false
 num_train_timestep: 1000
 timestep_shift: 5.0
@@ -46,7 +46,7 @@ image_or_video_shape:
 - 60
 - 104
 distribution_loss: dmd
-trainer: score_distillation
+trainer: diagdistillation
 gradient_checkpointing: true
 num_frame_per_block: 3
 load_raw_video: false

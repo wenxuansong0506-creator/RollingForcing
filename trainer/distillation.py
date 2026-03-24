@@ -120,11 +120,20 @@ class Trainer:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
+        num_workers = getattr(config, "num_workers", 0)
+        dataloader_kwargs = dict(
+            dataset=dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=num_workers,
+        )
+        if num_workers > 0:
+            dataloader_kwargs.update(
+                persistent_workers=True,
+                multiprocessing_context="spawn",
+                prefetch_factor=getattr(config, "prefetch_factor", 2),
+            )
+        dataloader = torch.utils.data.DataLoader(**dataloader_kwargs)
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -208,10 +217,10 @@ class Trainer:
 
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
-        if self.config.i2v:
-            clean_latent = None
-            image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
+        if "ode_latent" in batch:
+            clean_latent = batch["ode_latent"][:, -1].to(
                 device=self.device, dtype=self.dtype)
+            image_latent = clean_latent[:, 0:1] if self.config.i2v else None
         else:
             clean_latent = None
             image_latent = None
@@ -363,6 +372,27 @@ class Trainer:
                         generator_log_dict["dmdtrain_gradient_norm"].mean().item(),
                         self.step
                     )
+                    for key in [
+                        "high_noise_ratio",
+                        "fake_cond_score_high_noise_ratio_actual",
+                        "fake_uncond_score_high_noise_ratio_actual",
+                        "real_cond_score_high_noise_ratio_actual",
+                        "real_uncond_score_high_noise_ratio_actual",
+                        "fake_cond_score_high_noise_count",
+                        "fake_cond_score_low_noise_count",
+                        "fake_uncond_score_high_noise_count",
+                        "fake_uncond_score_low_noise_count",
+                        "real_cond_score_high_noise_count",
+                        "real_cond_score_low_noise_count",
+                        "real_uncond_score_high_noise_count",
+                        "real_uncond_score_low_noise_count",
+                    ]:
+                        if key in generator_log_dict:
+                            self.writer.add_scalar(
+                                key,
+                                generator_log_dict[key].float().mean().item(),
+                                self.step
+                            )
 
                 self.writer.add_scalar(
                     "critic_loss",
@@ -374,6 +404,18 @@ class Trainer:
                     critic_log_dict["critic_grad_norm"].mean().item(),
                     self.step
                 )
+                for key in [
+                    "critic_high_noise_ratio",
+                    "critic_fake_score_high_noise_ratio_actual",
+                    "critic_fake_score_high_noise_count",
+                    "critic_fake_score_low_noise_count",
+                ]:
+                    if key in critic_log_dict:
+                        self.writer.add_scalar(
+                            key,
+                            critic_log_dict[key].float().mean().item(),
+                            self.step
+                        )
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
@@ -386,6 +428,25 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
+                    routing_message = ""
+                    if (
+                        "high_noise_ratio" in generator_log_dict and
+                        "fake_cond_score_high_noise_count" in generator_log_dict and
+                        "fake_cond_score_low_noise_count" in generator_log_dict and
+                        "real_cond_score_high_noise_count" in generator_log_dict and
+                        "real_cond_score_low_noise_count" in generator_log_dict and
+                        "critic_fake_score_high_noise_count" in critic_log_dict and
+                        "critic_fake_score_low_noise_count" in critic_log_dict
+                    ):
+                        routing_message = (
+                            f"Generator high-noise ratio: {generator_log_dict['high_noise_ratio'].float().mean().item():.3f} | "
+                            f"Fake(cond) high/low: {generator_log_dict['fake_cond_score_high_noise_count'].float().mean().item():.0f}/"
+                            f"{generator_log_dict['fake_cond_score_low_noise_count'].float().mean().item():.0f} | "
+                            f"Real(cond) high/low: {generator_log_dict['real_cond_score_high_noise_count'].float().mean().item():.0f}/"
+                            f"{generator_log_dict['real_cond_score_low_noise_count'].float().mean().item():.0f} | "
+                            f"Critic fake high/low: {critic_log_dict['critic_fake_score_high_noise_count'].float().mean().item():.0f}/"
+                            f"{critic_log_dict['critic_fake_score_low_noise_count'].float().mean().item():.0f} | "
+                        )
                     self.writer.add_scalar(
                         "per iteration time",
                         current_time - self.previous_time,
@@ -394,5 +455,6 @@ class Trainer:
                     print(
                         f"Step {self.step} | "
                         f"Iteration time: {current_time - self.previous_time:.2f} seconds | "
+                        f"{routing_message}"
                     )
                     self.previous_time = current_time
