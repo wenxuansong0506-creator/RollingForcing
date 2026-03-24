@@ -6,7 +6,12 @@ import torch
 
 from pipeline import RollingForcingTrainingPipeline
 from utils.loss import get_denoising_loss
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_wrapper import (
+    WanDiffusionWrapper,
+    WanTextEncoder,
+    WanTimestepSwitchWrapper,
+    WanVAEWrapper,
+)
 
 
 class BaseModel(nn.Module):
@@ -26,15 +31,37 @@ class BaseModel(nn.Module):
     def _initialize_models(self, args, device):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
+        self.real_low_noise_model_name = getattr(args, "real_low_noise_name", self.real_model_name)
+        self.real_high_noise_model_name = getattr(args, "real_high_noise_name", self.real_model_name)
+        self.fake_low_noise_model_name = getattr(args, "fake_low_noise_name", self.fake_model_name)
+        self.fake_high_noise_model_name = getattr(args, "fake_high_noise_name", self.fake_model_name)
+        self.score_model_timestep_threshold = getattr(args, "score_model_timestep_threshold", 750)
 
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
-        self.real_score.model.requires_grad_(False)
+        if (
+            self.real_low_noise_model_name != self.real_high_noise_model_name
+            or self.fake_low_noise_model_name != self.fake_high_noise_model_name
+        ):
+            self.real_score = WanTimestepSwitchWrapper(
+                low_noise_model_name=self.real_low_noise_model_name,
+                high_noise_model_name=self.real_high_noise_model_name,
+                timestep_threshold=self.score_model_timestep_threshold,
+                is_causal=False
+            )
+            self.fake_score = WanTimestepSwitchWrapper(
+                low_noise_model_name=self.fake_low_noise_model_name,
+                high_noise_model_name=self.fake_high_noise_model_name,
+                timestep_threshold=self.score_model_timestep_threshold,
+                is_causal=False
+            )
+        else:
+            self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+            self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
 
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
-        self.fake_score.model.requires_grad_(True)
+        self.real_score.requires_grad_(False)
+        self.fake_score.requires_grad_(True)
 
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)
@@ -68,6 +95,8 @@ class BaseModel(nn.Module):
                 device=self.device,
                 dtype=torch.long
             ).repeat(1, num_frame)
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast(timestep, src=0)
             return timestep
         else:
             timestep = torch.randint(
@@ -92,6 +121,8 @@ class BaseModel(nn.Module):
                     timestep.shape[0], -1, num_frame_per_block)
                 timestep[:, :, 1:] = timestep[:, :, 0:1]
                 timestep = timestep.reshape(timestep.shape[0], -1)
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast(timestep, src=0)
             return timestep
 
 
