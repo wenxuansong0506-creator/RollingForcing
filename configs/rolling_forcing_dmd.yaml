@@ -3,6 +3,11 @@ generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
 real_name: Wan2.1-T2V-14B
+real_low_noise_name: Wan2.2-T2V-low-noise
+real_high_noise_name: Wan2.2-T2V-high-noise
+fake_low_noise_name: Wan2.2-T2V-low-noise
+fake_high_noise_name: Wan2.2-T2V-high-noise
+score_model_timestep_threshold: 750
 text_encoder_fsdp_wrap_strategy: size
 denoising_step_list:
 - 1000
@@ -27,6 +32,7 @@ beta1_critic: 0.0
 beta2_critic: 0.999
 data_path: prompts/vidprom_filtered_extended.txt
 batch_size: 1
+num_workers: 0
 ema_weight: 0.99
 ema_start_step: 200
 total_batch_size: 64

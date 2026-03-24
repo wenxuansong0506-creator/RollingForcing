@@ -51,6 +51,18 @@ class DMD(RollingForcingModel):
         else:
             self.scheduler.alphas_cumprod = None
 
+    @staticmethod
+    def _get_routing_log(score_model, prefix: str) -> dict:
+        routing_stats = getattr(score_model, "last_routing_stats", None)
+        if not routing_stats:
+            return {}
+        return {
+            f"{prefix}_high_noise_count": routing_stats["high_noise_count"],
+            f"{prefix}_low_noise_count": routing_stats["low_noise_count"],
+            f"{prefix}_high_noise_ratio_actual": routing_stats["high_noise_ratio"],
+            f"{prefix}_threshold": routing_stats["threshold"],
+        }
+
     def _compute_kl_grad(
         self, noisy_image_or_video: torch.Tensor,
         estimated_clean_image_or_video: torch.Tensor,
@@ -77,6 +89,7 @@ class DMD(RollingForcingModel):
             conditional_dict=conditional_dict,
             timestep=timestep
         )
+        fake_cond_log = self._get_routing_log(self.fake_score, "fake_cond_score")
 
         if self.fake_guidance_scale != 0.0:
             _, pred_fake_image_uncond = self.fake_score(
@@ -84,11 +97,14 @@ class DMD(RollingForcingModel):
                 conditional_dict=unconditional_dict,
                 timestep=timestep
             )
+            fake_uncond_log = self._get_routing_log(
+                self.fake_score, "fake_uncond_score")
             pred_fake_image = pred_fake_image_cond + (
                 pred_fake_image_cond - pred_fake_image_uncond
             ) * self.fake_guidance_scale
         else:
             pred_fake_image = pred_fake_image_cond
+            fake_uncond_log = {}
 
         # Step 2: Compute the real score
         # We compute the conditional and unconditional prediction
@@ -98,12 +114,14 @@ class DMD(RollingForcingModel):
             conditional_dict=conditional_dict,
             timestep=timestep
         )
+        real_cond_log = self._get_routing_log(self.real_score, "real_cond_score")
 
         _, pred_real_image_uncond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=unconditional_dict,
             timestep=timestep
         )
+        real_uncond_log = self._get_routing_log(self.real_score, "real_uncond_score")
 
         pred_real_image = pred_real_image_cond + (
             pred_real_image_cond - pred_real_image_uncond
@@ -122,7 +140,12 @@ class DMD(RollingForcingModel):
 
         return grad, {
             "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
-            "timestep": timestep.detach()
+            "timestep": timestep.detach(),
+            "high_noise_ratio": (timestep > self.score_model_timestep_threshold).float().mean().detach(),
+            **fake_cond_log,
+            **fake_uncond_log,
+            **real_cond_log,
+            **real_uncond_log,
         }
 
     def compute_distribution_matching_loss(
@@ -295,6 +318,8 @@ class DMD(RollingForcingModel):
             conditional_dict=conditional_dict,
             timestep=critic_timestep
         )
+        fake_critic_routing_log = self._get_routing_log(
+            self.fake_score, "critic_fake_score")
 
         # Step 3: Compute the denoising loss for the fake critic
         if self.args.denoising_loss_type == "flow":
@@ -326,7 +351,8 @@ class DMD(RollingForcingModel):
 
         # Step 5: Debugging Log
         critic_log_dict = {
-            "critic_timestep": critic_timestep.detach()
+            "critic_timestep": critic_timestep.detach(),
+            "critic_high_noise_ratio": (critic_timestep > self.score_model_timestep_threshold).float().mean().detach(),
+            **fake_critic_routing_log,
         }
-
         return denoising_loss, critic_log_dict

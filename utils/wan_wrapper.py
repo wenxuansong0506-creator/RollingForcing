@@ -311,3 +311,135 @@ class WanDiffusionWrapper(torch.nn.Module):
         We can gradually add more methods here if needed.
         """
         self.get_scheduler()
+
+
+class WanTimestepSwitchWrapper(torch.nn.Module):
+    def __init__(
+            self,
+            low_noise_model_name: str,
+            high_noise_model_name: str,
+            timestep_threshold: int = 750,
+            is_causal: bool = False,
+            **kwargs
+    ):
+        super().__init__()
+        self.low_noise_model = WanDiffusionWrapper(
+            model_name=low_noise_model_name,
+            is_causal=is_causal,
+            **kwargs
+        )
+        self.high_noise_model = WanDiffusionWrapper(
+            model_name=high_noise_model_name,
+            is_causal=is_causal,
+            **kwargs
+        )
+        self.timestep_threshold = timestep_threshold
+        self.uniform_timestep = self.low_noise_model.uniform_timestep
+        self.scheduler = self.low_noise_model.scheduler
+        self.seq_len = self.low_noise_model.seq_len
+        self.last_routing_stats = {}
+
+    @property
+    def model(self):
+        return self.low_noise_model.model
+
+    def enable_gradient_checkpointing(self) -> None:
+        self.low_noise_model.enable_gradient_checkpointing()
+        self.high_noise_model.enable_gradient_checkpointing()
+
+    def adding_cls_branch(self, *args, **kwargs) -> None:
+        self.low_noise_model.adding_cls_branch(*args, **kwargs)
+        self.high_noise_model.adding_cls_branch(*args, **kwargs)
+
+    @staticmethod
+    def _slice_condition(conditional_dict: dict, mask: torch.Tensor, batch_size: int) -> dict:
+        sliced_dict = {}
+        for key, value in conditional_dict.items():
+            if torch.is_tensor(value) and value.shape[0] == batch_size:
+                sliced_dict[key] = value[mask]
+            else:
+                sliced_dict[key] = value
+        return sliced_dict
+
+    def forward(
+        self,
+        noisy_image_or_video: torch.Tensor,
+        conditional_dict: dict,
+        timestep: torch.Tensor,
+        **kwargs
+    ):
+        if kwargs.get("kv_cache", None) is not None or kwargs.get("crossattn_cache", None) is not None:
+            raise NotImplementedError(
+                "WanTimestepSwitchWrapper does not support kv/cross-attention cache routing yet. "
+                "The current DMD integration only uses it for non-causal real/fake score models."
+            )
+
+        routing_timestep = timestep[:, 0] if timestep.ndim == 2 else timestep
+        high_noise_mask = routing_timestep > self.timestep_threshold
+        batch_size = noisy_image_or_video.shape[0]
+        self.last_routing_stats = {
+            "high_noise_count": high_noise_mask.sum().detach(),
+            "low_noise_count": (~high_noise_mask).sum().detach(),
+            "high_noise_ratio": high_noise_mask.float().mean().detach(),
+            "threshold": torch.tensor(
+                self.timestep_threshold,
+                device=routing_timestep.device,
+                dtype=torch.float32
+            )
+        }
+
+        flow_pred = torch.empty_like(noisy_image_or_video)
+        pred_x0 = torch.empty_like(noisy_image_or_video)
+        logits = None
+
+        if high_noise_mask.any():
+            high_output = self.high_noise_model(
+                noisy_image_or_video=noisy_image_or_video[high_noise_mask],
+                conditional_dict=self._slice_condition(
+                    conditional_dict, high_noise_mask, batch_size),
+                timestep=timestep[high_noise_mask],
+                **kwargs
+            )
+            if len(high_output) == 3:
+                high_flow_pred, high_pred_x0, high_logits = high_output
+            else:
+                high_flow_pred, high_pred_x0 = high_output
+                high_logits = None
+            flow_pred[high_noise_mask] = high_flow_pred
+            pred_x0[high_noise_mask] = high_pred_x0
+            if high_logits is not None:
+                logits = torch.empty(
+                    (batch_size, *high_logits.shape[1:]),
+                    device=high_logits.device,
+                    dtype=high_logits.dtype
+                )
+                logits[high_noise_mask] = high_logits
+
+        if (~high_noise_mask).any():
+            low_output = self.low_noise_model(
+                noisy_image_or_video=noisy_image_or_video[~high_noise_mask],
+                conditional_dict=self._slice_condition(
+                    conditional_dict, ~high_noise_mask, batch_size),
+                timestep=timestep[~high_noise_mask],
+                **kwargs
+            )
+            if len(low_output) == 3:
+                low_flow_pred, low_pred_x0, low_logits = low_output
+            else:
+                low_flow_pred, low_pred_x0 = low_output
+                low_logits = None
+            flow_pred[~high_noise_mask] = low_flow_pred
+            pred_x0[~high_noise_mask] = low_pred_x0
+            if low_logits is not None:
+                if logits is None:
+                    logits = torch.empty(
+                        (batch_size, *low_logits.shape[1:]),
+                        device=low_logits.device,
+                        dtype=low_logits.dtype
+                    )
+                logits[~high_noise_mask] = low_logits
+
+        if logits is not None:
+            return flow_pred, pred_x0, logits
+
+        return flow_pred, pred_x0
